@@ -38,19 +38,8 @@ def detect_environment():
 
 def setup_paths():
     """Setup project paths based on environment."""
-    env_type = detect_environment()
-
-    if env_type == 'kaggle':
-        # On Kaggle: clone repo if needed
-        repo_path = '/kaggle/working/G2P2C'
-        if not os.path.exists(repo_path):
-            os.system('git clone https://github.com/chirathyh/G2P2C.git /kaggle/working/G2P2C')
-            os.system('cd /kaggle/working/G2P2C/environments/simglucose-0.2.2 && pip install -e .')
-            os.system('pip install python-decouple scipy pandas gym==0.9.4')
-        main_path = repo_path
-    else:
-        # Local: use the project directory
-        main_path = os.path.dirname(os.path.abspath(__file__))
+    # Local or Kaggle: use the current project directory where the script is located
+    main_path = os.path.dirname(os.path.abspath(__file__))
 
     # Create .env file
     env_file = os.path.join(main_path, '.env')
