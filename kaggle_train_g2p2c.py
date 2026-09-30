@@ -20,7 +20,11 @@ import shutil
 import random
 import argparse
 import numpy as np
+import warnings
 from copy import deepcopy
+
+# Mute pandas FutureWarnings caused by older simglucose library
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # ============================================================
 # CONFIGURATION - CHANGE THESE FOR DIFFERENT PATIENTS
