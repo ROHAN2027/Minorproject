@@ -166,10 +166,8 @@ def train(patient_id=20, seed=3, device='cuda', debug=0):
     print(f"{'='*60}\n")
 
     # Create args namespace manually (avoiding argparse conflicts in notebooks)
-    class Args:
-        pass
-
-    args = Args()
+    import argparse
+    args = argparse.Namespace()
     args.agent = 'g2p2c'
     args.folder_id = folder_id
     args.patient_id = patient_id
