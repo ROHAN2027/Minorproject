@@ -298,7 +298,10 @@ def train(patient_id=20, seed=3, device='cuda', debug=0):
 
     # Train
     print("Starting training...")
-    agent.run(args, patients, env_ids, seed)
+    try:
+        agent.run(args, patients, env_ids, seed)
+    except SystemExit:
+        pass  # The original G2P2C code calls exit() when done, we must catch it!
 
     # Save best weights with clean names
     save_best_weights(main_path, folder_id, patient_id)
