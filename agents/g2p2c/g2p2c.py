@@ -1,4 +1,5 @@
 import gc
+import os
 import gym
 import random
 import csv
@@ -396,6 +397,16 @@ class G2P2C:
         stop_criteria_len, stop_criteria_threshold = 10, 5
         ri_arr = np.ones(stop_criteria_len, dtype=np.float32) * 1000
 
+        # Resume support: restore training state if resuming
+        start_rollout = 0
+        if hasattr(args, 'resume_rollout') and args.resume_rollout > 0:
+            start_rollout = args.resume_rollout
+            self.completed_interactions = getattr(args, 'resume_interactions', 0)
+            last_lr_update = getattr(args, 'resume_last_lr_update', 0)
+            print(f'[RESUME] Resuming from rollout {start_rollout}, '
+                  f'interactions={self.completed_interactions}, '
+                  f'last_lr_update={last_lr_update}')
+
         # setting up the testing arguments
         testing_args = deepcopy(args)
         testing_args.meal_amount = [40, 20, 80, 10, 60, 30]
@@ -406,8 +417,12 @@ class G2P2C:
         worker_agents = [Worker(args, 'training', patients, env_ids, i+5, i, self.device) for i in range(self.n_training_workers)]
         testing_agents = [Worker(testing_args, 'testing', patients, env_ids, i+5000, i+5000, self.device) for i in range(self.n_testing_workers)]
 
+        # Checkpoint settings
+        checkpoint_frequency = 5  # save resume checkpoint every 5 rollouts
+        checkpoint_dir = os.path.join(args.main_dir, 'trained_weights', 'resume_checkpoint')
+
         # ppo learning
-        for rollout in range(0, 30000):  # steps * n_workers * epochs
+        for rollout in range(start_rollout, 30000):  # steps * n_workers * epochs
             t1 = time.time()
             rmse, horizon_rmse = 0, 0
             for i in range(self.n_training_workers):
@@ -455,6 +470,41 @@ class G2P2C:
             if self.completed_interactions > MAX_INTERACTIONS:
                 experiment_done = True
                 job_status = 2
+
+            # ============================================================
+            # PERIODIC RESUME CHECKPOINT (every 5 rollouts)
+            # Saves to trained_weights/resume_checkpoint/ so you can
+            # resume if Kaggle crashes. Only keeps the latest checkpoint.
+            # ============================================================
+            if rollout % checkpoint_frequency == 0 and rollout > 0:
+                import json as _json
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                torch.save(self.policy.Actor, os.path.join(checkpoint_dir, 'Actor.pth'))
+                torch.save(self.policy.Critic, os.path.join(checkpoint_dir, 'Critic.pth'))
+                state_info = {
+                    'rollout': rollout,
+                    'completed_interactions': self.completed_interactions,
+                    'last_lr_update': last_lr_update,
+                }
+                with open(os.path.join(checkpoint_dir, 'state.json'), 'w') as f:
+                    _json.dump(state_info, f)
+                print(f'[CHECKPOINT] Saved at rollout {rollout} '
+                      f'(interactions: {self.completed_interactions})')
+
+            # Clean up old checkpoints in experiment dir (keep only last 2)
+            ckpt_dir = os.path.join(self.args.experiment_dir, 'checkpoints')
+            if os.path.isdir(ckpt_dir):
+                actor_files = sorted(
+                    [f for f in os.listdir(ckpt_dir) if f.endswith('_Actor.pth')],
+                    key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 0
+                )
+                # Delete all but the last 2 actor+critic pairs
+                for old_f in actor_files[:-2]:
+                    ep = old_f.replace('_Actor.pth', '')
+                    for suffix in ['_Actor.pth', '_Critic.pth']:
+                        old_path = os.path.join(ckpt_dir, ep + suffix)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
 
             # logging and termination
             if self.args.verbose:

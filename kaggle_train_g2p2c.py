@@ -138,7 +138,7 @@ def save_best_weights(main_path, folder_id, patient_id):
         print(f"\nKaggle download: /kaggle/working/trained_weights/")
 
 
-def train(patient_id=20, seed=3, device='cuda', debug=0):
+def train(patient_id=20, seed=3, device='cuda', debug=0, resume=False):
     """
     Train G2P2C for a specific adult patient.
 
@@ -147,6 +147,7 @@ def train(patient_id=20, seed=3, device='cuda', debug=0):
         seed: random seed for reproducibility
         device: 'cuda' or 'cpu'
         debug: 1 for quick test (4000 interactions), 0 for full training (800K)
+        resume: True to resume from last saved checkpoint
     """
     main_path = setup_paths()
 
@@ -276,6 +277,17 @@ def train(patient_id=20, seed=3, device='cuda', debug=0):
     # Apply G2P2C-specific parameter overrides
     args = set_args(args)
 
+    # ============================================================
+    # SPEED OPTIMIZATIONS (override after set_args)
+    # The bottleneck is CPU-based simglucose simulations, NOT GPU.
+    # These reduce CPU simulation count without hurting model quality.
+    # ============================================================
+    args.n_planning_simulations = 25   # default 50 → 25 (saves ~100s per rollout)
+    args.n_testing_workers = 5         # default 20 → 5  (saves ~65s per rollout)
+    print(f"Speed optimizations: planning_sims={args.n_planning_simulations}, "
+          f"test_workers={args.n_testing_workers}, "
+          f"train_workers={args.n_training_workers}")
+
     # Setup folders
     log_dir = setup_experiment_folders(main_path, folder_id)
     args.experiment_dir = log_dir
@@ -290,8 +302,43 @@ def train(patient_id=20, seed=3, device='cuda', debug=0):
     random.seed(seed)
     np.random.seed(seed)
 
-    # Create agent
-    agent = G2P2C(args, device, False, '', '')
+    # ============================================================
+    # RESUME FROM CHECKPOINT (if --resume 1)
+    # ============================================================
+    load_model = False
+    actor_path = ''
+    critic_path = ''
+    args.resume_rollout = 0
+    args.resume_interactions = 0
+    args.resume_last_lr_update = 0
+
+    if resume:
+        ckpt_dir = os.path.join(main_path, 'trained_weights', 'resume_checkpoint')
+        state_file = os.path.join(ckpt_dir, 'state.json')
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                ckpt_state = json.load(f)
+            actor_path = os.path.join(ckpt_dir, 'Actor.pth')
+            critic_path = os.path.join(ckpt_dir, 'Critic.pth')
+            if os.path.exists(actor_path) and os.path.exists(critic_path):
+                load_model = True
+                args.resume_rollout = ckpt_state['rollout'] + 1  # start from next rollout
+                args.resume_interactions = ckpt_state['completed_interactions']
+                args.resume_last_lr_update = ckpt_state['last_lr_update']
+                print(f"\n{'='*60}")
+                print(f"RESUMING FROM CHECKPOINT")
+                print(f"{'='*60}")
+                print(f"Last saved rollout: {ckpt_state['rollout']}")
+                print(f"Interactions done:  {ckpt_state['completed_interactions']}")
+                print(f"Resuming from:      rollout {args.resume_rollout}")
+                print(f"{'='*60}\n")
+            else:
+                print("WARNING: Checkpoint state.json found but .pth files missing. Starting fresh.")
+        else:
+            print("No checkpoint found. Starting fresh training.")
+
+    # Create agent (with or without loading checkpoint weights)
+    agent = G2P2C(args, device, load_model, actor_path, critic_path)
 
     # Get patients and environments
     patients, env_ids = get_patient_env()
@@ -317,6 +364,8 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda', help='cpu or cuda')
     parser.add_argument('--debug', type=int, default=0,
                         help='1 for quick test, 0 for full training')
+    parser.add_argument('--resume', type=int, default=0,
+                        help='1 to resume from last checkpoint, 0 for fresh start')
     cli_args = parser.parse_args()
 
     if cli_args.patient_id < 20 or cli_args.patient_id > 29:
@@ -327,5 +376,6 @@ if __name__ == '__main__':
         patient_id=cli_args.patient_id,
         seed=cli_args.seed,
         device=cli_args.device,
-        debug=cli_args.debug
+        debug=cli_args.debug,
+        resume=cli_args.resume == 1
     )
