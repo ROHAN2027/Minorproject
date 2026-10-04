@@ -270,8 +270,8 @@ class ActorCritic(nn.Module):
         self.Actor = ActorNetwork(args, device)
         self.Critic = CriticNetwork(args, device)
         if load:
-            self.Actor = torch.load(actor_path, map_location=device)
-            self.Critic = torch.load(critic_path, map_location=device)
+            self.Actor = torch.load(actor_path, map_location=device, weights_only=False)
+            self.Critic = torch.load(critic_path, map_location=device, weights_only=False)
         self.distribution = torch.distributions.Normal
         self.is_testing_worker = False
 
