@@ -41,12 +41,17 @@ class RandomScenario(Scenario):
         # time_ub = np.array([9, 10, 14, 16, 20, 23]) * 60
         # time_mu = np.array([7, 9.5, 12, 15, 18, 21.5]) * 60
 
-        time_lb = np.array([7, 10, 12, 16, 19, 22]) * 60  # if using fractions make sure time_sigma is 30
-        time_ub = np.array([9, 11, 14, 17, 21, 23]) * 60
-        time_mu = np.array([8, 10.5, 13, 16.5, 20, 22.5]) * 60
-
         #opt = Options().parse()
         opt = self.opt
+
+        if hasattr(opt, 'meal_time') and opt.meal_time:
+            time_mu = np.array(opt.meal_time)
+            time_lb = time_mu - 60
+            time_ub = time_mu + 60
+        else:
+            time_lb = np.array([7, 10, 12, 16, 19, 22]) * 60  # if using fractions make sure time_sigma is 30
+            time_ub = np.array([9, 11, 14, 17, 21, 23]) * 60
+            time_mu = np.array([8, 10.5, 13, 16.5, 20, 22.5]) * 60
         amount_mu = opt.meal_amount
         amount_sigma = opt.meal_variance
 

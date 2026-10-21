@@ -316,8 +316,9 @@ def create_sim_args(patient_id, meal_amounts, meal_times_minutes):
     args.target_action_lim = 0.5
 
     # Meal configuration - deterministic for simulation
-    # meal_amounts = [breakfast_carbs, 0, lunch_carbs, 0, dinner_carbs, 0]
+    # meal_amounts = [breakfast_carbs, snack1, lunch_carbs, snack2, dinner_carbs, snack3]
     args.meal_amount = meal_amounts
+    args.meal_time = meal_times_minutes
     args.meal_variance = [1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8]
     args.time_variance = [1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8]
     args.meal_prob = [1 if meal_amounts[0] > 0 else -1, -1,
@@ -349,6 +350,7 @@ def run_simulation(policy, args, device='cpu', seed=100):
     from utils.pumpAction import Pump
     from utils.statespace import StateSpace
     from utils.reward_func import composite_reward
+    import time as _time
 
     patients = (
         [f'adolescent#0{str(i).zfill(2)}' for i in range(1, 11)] +
@@ -356,7 +358,9 @@ def run_simulation(policy, args, device='cpu', seed=100):
         [f'adult#0{str(i).zfill(2)}' for i in range(1, 11)]
     )
     patient_name = patients[args.patient_id]
-    env_id = f'simglucose-sim-{seed}-v0'
+    # Use unique env_id each run to avoid "Cannot re-register" error
+    unique_id = int(_time.time() * 1000) % 1000000
+    env_id = f'simglucose-sim-{seed}-{unique_id}-v0'
 
     env = get_env(args, patient_name=patient_name, env_id=env_id,
                   custom_reward=custom_reward, seed=seed)
@@ -398,10 +402,12 @@ def run_simulation(policy, args, device='cpu', seed=100):
 
         state, _reward, is_done, info = env.step(pump_action)
 
-        # Time of day (starts at midnight)
-        minutes = step * 5
-        hours = minutes // 60
-        mins = minutes % 60
+        # Time of day: simulation starts at 23:00 (11 PM) + calibration steps
+        total_minutes_from_23 = (args.calibration + step) * 5
+        # Convert to clock time (23:00 + offset, wrapping at 24h)
+        clock_minutes = (23 * 60 + total_minutes_from_23) % (24 * 60)
+        hours = clock_minutes // 60
+        mins = clock_minutes % 60
         time_str = f"{hours:02d}:{mins:02d}"
 
         # Collect data
@@ -417,17 +423,6 @@ def run_simulation(policy, args, device='cpu', seed=100):
             meal=info['remaining_time'], hour=(step + 1),
             meal_type=info['meal_type'], carbs=info.get('future_carb', 0)
         )
-
-        # Safety check
-        if state.CGM <= 40 or state.CGM >= 600:
-            # Fill remaining with last value
-            for _ in range(step + 1, sim_steps):
-                glucose_data.append(state.CGM)
-                insulin_data.append(0)
-                meal_data.append(0)
-                minutes = len(glucose_data) * 5
-                time_data.append(f"{minutes // 60:02d}:{minutes % 60:02d}")
-            break
 
     return {
         'glucose': glucose_data,
@@ -465,6 +460,103 @@ def compute_clinical_metrics(glucose_data):
         'LBGI': f'{LBGI:.2f}',
         'HBGI': f'{HBGI:.2f}',
     }
+
+
+def compute_meal_recovery_times(sim_data, meal_config):
+    """
+    For each meal, find:
+    - The time glucose first exceeded 180 mg/dL after the meal
+    - The time glucose returned to the 70-180 mg/dL normal range
+    - The recovery duration in minutes
+    Returns a list of dicts with meal name, peak glucose, and recovery info.
+    """
+    glucose = np.array(sim_data['glucose'])
+    time_labels = sim_data['time']
+    meals_carbs = np.array(sim_data['meals'])
+    n = len(glucose)
+
+    recovery_results = []
+
+    for meal_name, config in meal_config.items():
+        meal_time_minutes = config['time_minutes']
+
+        # The simulation starts at 23:00 with calibration steps.
+        # time_labels[i] is the clock time for step i.
+        # Find the step index closest to the meal time.
+        meal_step = None
+        for i, t_str in enumerate(time_labels):
+            parts = t_str.split(':')
+            t_min = int(parts[0]) * 60 + int(parts[1])
+            if t_min >= meal_time_minutes:
+                meal_step = i
+                break
+
+        if meal_step is None:
+            recovery_results.append({
+                'meal': meal_name,
+                'carbs': config['carbs'],
+                'meal_time': f"{meal_time_minutes // 60:02d}:{meal_time_minutes % 60:02d}",
+                'peak_glucose': 'N/A',
+                'recovery_time': 'Never left range',
+                'recovery_minutes': 0,
+            })
+            continue
+
+        # Search window: from meal time to meal + 5 hours (60 steps at 5 min each)
+        search_end = min(meal_step + 60, n)
+        window = glucose[meal_step:search_end]
+
+        peak_glucose = float(np.max(window))
+        peak_step = meal_step + int(np.argmax(window))
+
+        # Check if glucose ever went above 180 after this meal
+        if peak_glucose <= 180:
+            recovery_results.append({
+                'meal': meal_name,
+                'carbs': config['carbs'],
+                'meal_time': f"{meal_time_minutes // 60:02d}:{meal_time_minutes % 60:02d}",
+                'peak_glucose': f'{peak_glucose:.0f} mg/dL',
+                'recovery_time': 'Stayed in range ✅',
+                'recovery_minutes': 0,
+            })
+            continue
+
+        # Find when glucose first exceeds 180 after the meal
+        exit_step = None
+        for i in range(meal_step, search_end):
+            if glucose[i] > 180:
+                exit_step = i
+                break
+
+        # Find when glucose returns to <= 180 after the peak
+        recovery_step = None
+        for i in range(peak_step, min(peak_step + 72, n)):  # search up to 6 hours after peak
+            if glucose[i] <= 180:
+                recovery_step = i
+                break
+
+        if recovery_step is not None and exit_step is not None:
+            recovery_mins = (recovery_step - exit_step) * 5
+            recovery_time_str = time_labels[recovery_step] if recovery_step < len(time_labels) else 'N/A'
+            recovery_results.append({
+                'meal': meal_name,
+                'carbs': config['carbs'],
+                'meal_time': f"{meal_time_minutes // 60:02d}:{meal_time_minutes % 60:02d}",
+                'peak_glucose': f'{peak_glucose:.0f} mg/dL',
+                'recovery_time': f'{recovery_mins} min (at {recovery_time_str})',
+                'recovery_minutes': recovery_mins,
+            })
+        else:
+            recovery_results.append({
+                'meal': meal_name,
+                'carbs': config['carbs'],
+                'meal_time': f"{meal_time_minutes // 60:02d}:{meal_time_minutes % 60:02d}",
+                'peak_glucose': f'{peak_glucose:.0f} mg/dL',
+                'recovery_time': 'Did not recover ⚠️',
+                'recovery_minutes': -1,
+            })
+
+    return recovery_results
 
 
 def create_simulation_chart(sim_data):
@@ -661,33 +753,230 @@ def main():
         st.markdown('<p class="input-label">Controller</p>', unsafe_allow_html=True)
         controller = st.selectbox('Controller', ['🤖 G2P2C (AI)'], label_visibility='collapsed')
 
-    # --- Meal Protocol ---
+    # --- Meal Protocol with Food Selection ---
     st.markdown('<p class="section-header">Meal protocol</p>', unsafe_allow_html=True)
+
+    # Import food database
+    try:
+        from food_database import FOOD_DATABASE, get_food_info, calculate_carbs, get_food_list
+        food_list = get_food_list()
+        has_food_db = True
+    except ImportError:
+        food_list = []
+        has_food_db = False
 
     meal_config = {}
     meals = [
-        ('Breakfast', 40, '08:00'),
-        ('Lunch', 80, '13:00'),
-        ('Dinner', 60, '20:00'),
+        ('Breakfast', '08:00', 'Apple'),
+        ('Lunch', '13:00', 'Roti/Chapati'),
+        ('Dinner', '20:00', 'Plain Cooked Rice'),
     ]
 
-    for meal_name, default_carbs, default_time in meals:
-        st.markdown(f'<div class="sim-card">', unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([1, 2, 2])
-        with c1:
-            st.markdown(f'<p class="meal-label"><b>{meal_name}</b></p>', unsafe_allow_html=True)
-        with c2:
+    food_options = ['-- Custom (enter carbs manually) --'] + food_list if has_food_db else ['-- Custom (enter carbs manually) --']
+
+    for meal_name, default_time, initial_food in meals:
+        st.markdown('<div class="sim-card">', unsafe_allow_html=True)
+        st.markdown(f'<p class="meal-label"><b>{meal_name}</b></p>', unsafe_allow_html=True)
+
+        items_key = f'meal_items_{meal_name}'
+        next_id_key = f'meal_next_id_{meal_name}'
+
+        # Initialize item list for this meal if not already present
+        if items_key not in st.session_state:
+            st.session_state[items_key] = [0]
+            st.session_state[next_id_key] = 1
+            default_item_food = initial_food if initial_food in food_list else food_options[0]
+            st.session_state[f'{meal_name}_0_food'] = default_item_food
+            f_init = get_food_info(default_item_food) if has_food_db else None
+            if f_init:
+                st.session_state[f'{meal_name}_0_unit'] = f_init['default_unit']
+                st.session_state[f'{meal_name}_0_qty'] = float(f_init['default_qty'])
+                st.session_state[f'{meal_name}_0_rate'] = float(f_init['carbs_per_unit'])
+                st.session_state[f'{meal_name}_0_prev_food'] = default_item_food
+            else:
+                st.session_state[f'{meal_name}_0_unit'] = 'grams'
+                st.session_state[f'{meal_name}_0_qty'] = 1.0
+                st.session_state[f'{meal_name}_0_rate'] = 0.0
+                st.session_state[f'{meal_name}_0_prev_food'] = food_options[0]
+
+        item_ids = list(st.session_state[items_key])
+        meal_item_details = []
+        item_to_remove = None
+        total_meal_carbs = 0.0
+
+        if has_food_db:
+            # Header column titles
+            h1, h2, h3, h4, h5, h6 = st.columns([2.8, 1.2, 0.9, 1.2, 0.9, 0.5])
+            with h1:
+                st.markdown('<p class="input-label">Food Item</p>', unsafe_allow_html=True)
+            with h2:
+                st.markdown('<p class="input-label">Unit</p>', unsafe_allow_html=True)
+            with h3:
+                st.markdown('<p class="input-label">Qty</p>', unsafe_allow_html=True)
+            with h4:
+                st.markdown('<p class="input-label">Carbs/Unit (g) ✏️</p>', unsafe_allow_html=True)
+            with h5:
+                st.markdown('<p class="input-label">Carbs</p>', unsafe_allow_html=True)
+            with h6:
+                st.write("")
+
+            for item_id in item_ids:
+                food_key = f'{meal_name}_{item_id}_food'
+                unit_key = f'{meal_name}_{item_id}_unit'
+                qty_key = f'{meal_name}_{item_id}_qty'
+                rate_key = f'{meal_name}_{item_id}_rate'
+                prev_food_key = f'{meal_name}_{item_id}_prev_food'
+
+                # Sync defaults when food selection changes
+                current_food = st.session_state.get(food_key, food_options[0])
+                prev_food = st.session_state.get(prev_food_key)
+
+                if current_food != prev_food:
+                    st.session_state[prev_food_key] = current_food
+                    if current_food != '-- Custom (enter carbs manually) --':
+                        f_info = get_food_info(current_food)
+                        if f_info:
+                            st.session_state[unit_key] = f_info['default_unit']
+                            st.session_state[qty_key] = float(f_info['default_qty'])
+                            st.session_state[rate_key] = float(f_info['carbs_per_unit'])
+                    else:
+                        st.session_state[unit_key] = 'grams'
+                        st.session_state[qty_key] = 1.0
+                        st.session_state[rate_key] = 0.0
+
+                c1, c2, c3, c4, c5, c6 = st.columns([2.8, 1.2, 0.9, 1.2, 0.9, 0.5])
+
+                with c1:
+                    selected_food = st.selectbox(
+                        f'{meal_name} Item {item_id}',
+                        food_options,
+                        key=food_key,
+                        label_visibility='collapsed'
+                    )
+
+                is_custom = (selected_food == '-- Custom (enter carbs manually) --')
+                food_info = get_food_info(selected_food) if not is_custom else None
+
+                with c2:
+                    if food_info:
+                        avail_units = list(food_info['available_units'].keys())
+                        if st.session_state.get(unit_key) not in avail_units:
+                            st.session_state[unit_key] = food_info['default_unit']
+                        selected_unit = st.selectbox(
+                            f'{meal_name} Unit {item_id}',
+                            avail_units,
+                            key=unit_key,
+                            label_visibility='collapsed'
+                        )
+                    else:
+                        selected_unit = 'grams'
+                        st.markdown('<p style="color:#8fbc8f;font-size:12px;margin-top:8px;">grams</p>', unsafe_allow_html=True)
+
+                with c3:
+                    default_qty = food_info['default_qty'] if food_info else 1.0
+                    max_qty = 1000.0 if default_qty > 50 else 500.0
+                    step_val = 5.0 if default_qty >= 50 else 0.5
+                    quantity = st.number_input(
+                        f'{meal_name} Qty {item_id}',
+                        min_value=0.0, max_value=max_qty,
+                        step=step_val,
+                        key=qty_key,
+                        label_visibility='collapsed'
+                    )
+
+                with c4:
+                    carb_rate = st.number_input(
+                        f'{meal_name} Rate {item_id}',
+                        min_value=0.0, max_value=500.0,
+                        step=1.0,
+                        key=rate_key,
+                        help=f'Carbs per {food_info["default_unit"] if food_info else "unit"}. Edit if product nutrition differs!',
+                        label_visibility='collapsed'
+                    )
+
+                # Calculate item carbohydrates
+                if food_info:
+                    conv = food_info['available_units'].get(selected_unit, 1.0)
+                else:
+                    conv = 1.0
+                item_carbs = round(carb_rate * quantity * conv, 1)
+                total_meal_carbs += item_carbs
+
+                with c5:
+                    st.markdown(f'<div style="padding-top:8px;font-weight:600;color:#68d391;font-size:13px;">{item_carbs:.0f}g</div>', unsafe_allow_html=True)
+
+                with c6:
+                    if len(item_ids) > 1:
+                        if st.button('🗑️', key=f'del_{meal_name}_{item_id}', help='Remove this food item'):
+                            item_to_remove = item_id
+
+                if not is_custom:
+                    meal_item_details.append(f"{quantity:g}x {selected_food} ({item_carbs:.0f}g)")
+                elif item_carbs > 0:
+                    meal_item_details.append(f"Custom ({item_carbs:.0f}g)")
+
+            if item_to_remove is not None:
+                st.session_state[items_key].remove(item_to_remove)
+                st.rerun()
+
+            # Add Item Button & Combination Summary
+            add_col1, add_col2 = st.columns([1.5, 4])
+            with add_col1:
+                if st.button(f'➕ Add Food to {meal_name}', key=f'add_btn_{meal_name}'):
+                    new_id = st.session_state[next_id_key]
+                    st.session_state[items_key].append(new_id)
+                    st.session_state[next_id_key] += 1
+                    # Pick a different default next food
+                    new_default_food = food_list[0] if food_list else food_options[0]
+                    st.session_state[f'{meal_name}_{new_id}_food'] = new_default_food
+                    f_new = get_food_info(new_default_food) if has_food_db else None
+                    if f_new:
+                        st.session_state[f'{meal_name}_{new_id}_unit'] = f_new['default_unit']
+                        st.session_state[f'{meal_name}_{new_id}_qty'] = float(f_new['default_qty'])
+                        st.session_state[f'{meal_name}_{new_id}_rate'] = float(f_new['carbs_per_unit'])
+                        st.session_state[f'{meal_name}_{new_id}_prev_food'] = new_default_food
+                    st.rerun()
+
+            with add_col2:
+                if meal_item_details:
+                    summary_str = " + ".join(meal_item_details)
+                    st.markdown(f'<p style="color:#80cbc4;font-size:12px;margin-top:6px;margin-bottom:0;">🥗 <b>Combination:</b> {summary_str}</p>', unsafe_allow_html=True)
+
+            auto_carbs = round(total_meal_carbs)
+
+        else:
+            auto_carbs = 40 if meal_name == 'Breakfast' else (80 if meal_name == 'Lunch' else 60)
+
+        # Automatically synchronize Total Carbohydrates with the calculated sum of items
+        carbs_key = f'{meal_name}_carbs'
+        last_calc_key = f'{meal_name}_last_calc_carbs'
+
+        if carbs_key not in st.session_state:
+            st.session_state[carbs_key] = int(auto_carbs)
+            st.session_state[last_calc_key] = auto_carbs
+        elif st.session_state.get(last_calc_key) != auto_carbs:
+            st.session_state[carbs_key] = int(auto_carbs)
+            st.session_state[last_calc_key] = auto_carbs
+
+        # Total Carbs and Meal Time row
+        ct1, ct2 = st.columns([1, 1])
+        with ct1:
             carbs = st.number_input(
-                f'{meal_name} Carbohydrates (g)',
-                min_value=0, max_value=200, value=default_carbs,
-                step=5, key=f'{meal_name}_carbs'
+                f'{meal_name} Total Carbohydrates (g)',
+                min_value=0, max_value=500,
+                step=5,
+                key=carbs_key,
+                help='Auto-calculated sum of all food items in this meal. You can edit directly to override.'
             )
-        with c3:
+            if st.session_state.get(carbs_key) != int(auto_carbs):
+                st.caption(f'⚠️ Manually overridden (Calculated sum: {int(auto_carbs)}g)')
+        with ct2:
             time_val = st.time_input(
                 f'{meal_name} Time',
                 value=datetime.strptime(default_time, '%H:%M').time(),
                 key=f'{meal_name}_time'
             )
+
         st.markdown('</div>', unsafe_allow_html=True)
 
         meal_config[meal_name] = {
@@ -742,6 +1031,7 @@ def main():
                 # Store results in session state
                 st.session_state['sim_data'] = sim_data
                 st.session_state['sim_done'] = True
+                st.session_state['meal_config'] = meal_config
 
             except Exception as e:
                 st.error(f"Simulation failed: {str(e)}")
@@ -751,6 +1041,7 @@ def main():
     # --- Display Results ---
     if st.session_state.get('sim_done', False):
         sim_data = st.session_state['sim_data']
+        saved_meal_config = st.session_state.get('meal_config', meal_config)
 
         st.markdown("---")
 
@@ -852,6 +1143,42 @@ def main():
             <span>⏱ Duration: <b>24 hours</b></span>
         </div>
         """, unsafe_allow_html=True)
+
+        # --- Meal Recovery Times ---
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<p class="section-header">⏱ Meal Recovery (Time to Normal Range: 70-180 mg/dL)</p>',
+                    unsafe_allow_html=True)
+
+        recovery_data = compute_meal_recovery_times(sim_data, saved_meal_config)
+        rc_cols = st.columns(len(recovery_data))
+        for idx, rec in enumerate(recovery_data):
+            with rc_cols[idx]:
+                # Color coding based on recovery
+                if rec['recovery_minutes'] == 0:
+                    color = '#4caf50'  # green - stayed in range
+                    icon = '✅'
+                elif rec['recovery_minutes'] < 0:
+                    color = '#ff5252'  # red - did not recover
+                    icon = '⚠️'
+                elif rec['recovery_minutes'] <= 60:
+                    color = '#4caf50'  # green - fast recovery
+                    icon = '🟢'
+                elif rec['recovery_minutes'] <= 120:
+                    color = '#ffeb3b'  # yellow - moderate
+                    icon = '🟡'
+                else:
+                    color = '#ff9800'  # orange - slow
+                    icon = '🟠'
+
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h4>{icon} {rec['meal']} Recovery</h4>
+                    <p class="metric-value" style="color: {color}; font-size: 20px;">{rec['recovery_time']}</p>
+                    <p style="color:#8fbc8f; font-size:11px; margin:4px 0 0 0;">
+                        Carbs: {rec['carbs']}g at {rec['meal_time']} | Peak: {rec['peak_glucose']}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 if __name__ == '__main__':

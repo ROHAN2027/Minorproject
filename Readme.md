@@ -17,6 +17,32 @@
 <img src="https://chirathyh.github.io/images/gif_aps.gif" width="70%" alt="APS">
 </p>
 
+### Artificial Pancreas System (APS) Workflow
+Below is a conceptual representation of how the Reinforcement Learning agent interacts with the T1D patient environment:
+
+```mermaid
+flowchart TD
+    subgraph Environment ["In-Silico Patient Environment (simglucose)"]
+        P["Patient Metabolism & Physiology"]
+        S["Continuous Glucose Monitor - Sensor"]
+        M["External Disturbances: Meals, Exercise"]
+        M -.->|Impacts| P
+        P -->|Blood Glucose| S
+    end
+
+    subgraph Controller ["RL Agent / Artificial Pancreas"]
+        A["RL Policy Network"]
+        R["Reward Calculation"]
+        I["Insulin Pump - Actuator"]
+        A -->|Calculates Dose| I
+        S -->|State: CGM Readings| A
+        S -->|State: CGM Readings| R
+        R -.->|Feedback for Training| A
+    end
+
+    I -->|Insulin Delivery| P
+```
+
 Maintaining glucose levels is a life-long optimisation problem, complicated due to the disturbances associated with daily events (meals, exercise, stress.. etc), delays present in glucose sensing and insulin action, partial observability, and safety constraints among others. A simulation of glucose regulation, using a RL-based strategy is shown below, where the optimal glucose range is shaded in green severe hypoglycemia / hyperglycemia ranges highlighted by the red dotted line. The blood glucose measurements are presented in the top, while the administered insulin by the RL agent is presented in the bottom. The disturbances related to meal events and the carbohydrate content of the meals are presented in red.
 
 ![Glucose Regulation](img/gif_glucose.gif)
@@ -50,6 +76,54 @@ Project Contributions
 * We formulate the glucose regulation problem as a continuing continous control problem in an POMDP environemnt. We use the average reward RL setting and the Proximal Policy Optimisation (PPO) algorithm to develop a system which eliminates the requirement of carbohydrate estimation aiming to reduce the cognitive burden on people with T1D [[Paper]](https://ieeexplore.ieee.org/abstract/document/9871054) .<br>
 * The control space (i.e., the insulin secretion rate) consists of very small doses of insulin known as basal insulin and larger doses called bolus insulin which is used to counter large glucose fluctuations. We propose a non-linear continuous action space, inspired by clinical treatment to overcome challenges (skewed action distribution / redundant actions) associated with the continuous action space which improves the performance and efficiency in learning  [[Paper]](https://link.springer.com/chapter/10.1007/978-3-031-22695-3_39) .<br>
 * G2P2C: Glucose Control by Glucose Prediction and Planning, a deep reinforcement learning algorithm based on PPO, which introduced two auxiliary phases; model learning and planning. The model learning phase learns a glucose dynamics model while the planning phase fine-tunes the learnt policy to a short-horizon to counter the short-term fluctuations of glucose. The system eliminates the need for carbohydrate estimation and meal announcement [[Paper]](https://www.sciencedirect.com/science/article/pii/S1746809423012727). 
+
+## Deep Dive: Models & Architecture
+
+This repository ships with multiple advanced RL controllers (`agents/` directory) that treat each in-silico patient as an independent POMDP environment. 
+
+### 1. G2P2C (Glucose Control by Glucose Prediction & Planning)
+The flagship model of this repository, G2P2C, employs a 3-phase training architecture extending standard PPO:
+
+```mermaid
+flowchart TD
+    subgraph G2P2C_Arch ["G2P2C Agent Architecture"]
+        direction TB
+        subgraph Phase1 ["Phase 1: RL Optimization (PPO)"]
+            PPO["Proximal Policy Optimization"]
+            Action["Insulin Action"]
+            Value["Value Estimation"]
+            PPO -->|Actor Network| Action
+            PPO -->|Critic Network| Value
+        end
+        
+        subgraph Phase2 ["Phase 2: Model Learning"]
+            EnvModel["Glucose Dynamics Model"]
+            State["State: CGM"]
+            NextState["Next Glucose Level"]
+            State --> EnvModel
+            Action --> EnvModel
+            EnvModel -->|Predicts| NextState
+        end
+
+        subgraph Phase3 ["Phase 3: Planning"]
+            Plan["Short-Horizon Planner"]
+            FinalAction["Optimized Immediate Action"]
+            NextState --> Plan
+            Plan -->|Fine-tunes| FinalAction
+        end
+    end
+```
+- **Phase 1 (Base Policy):** Learns a robust general policy using PPO.
+- **Phase 2 (Dynamics Model):** Simultaneously learns an internal predictive model of how the patient's glucose responds to insulin over time.
+- **Phase 3 (Planning):** Uses the predicted trajectory to perform a short-horizon optimization step, refining the immediate insulin dosage to prevent sudden spikes or drops.
+
+### 2. Supported Baseline Agents
+- **PPO (Proximal Policy Optimization):** The standard on-policy actor-critic algorithm used as the foundation.
+- **SAC (Soft Actor-Critic):** An off-policy algorithm emphasizing maximum entropy for better exploration and robustness.
+- **A2C (Advantage Actor-Critic):** A standard synchronous actor-critic baseline.
+- **TD3 (Twin Delayed DDPG):** An off-policy algorithm that reduces overestimation bias in Q-learning.
+- **Clinical Baselines (BB / BBHE):** Standard Basal-Bolus controllers requiring manual meal announcements for comparison.
+
 
 Using the project
 --
@@ -91,8 +165,6 @@ cd experiments
 python run_RL_agent.py --agent g2p2c --folder_id test --patient_id 0 --return_type average --action_type exponential --device cpu --seed 3 --debug 0
 ```
 
-
-
 <h4>Running Experiments</h4>
 
 * **Setup simulation environment and scenario**.\
@@ -101,6 +173,32 @@ The parameters of the environment such as the meal protocol, sensor / pump hardw
 Parameters of target agents can be setup using the <code>parameters.py</code> file located in the respective project folder e.g. <code>/agents/ppo/parameters.py</code>
 * **Run experiment**\
 The required experiments can be run as highlighted in the **Quick Start** section.
+
+### Experiment Pipeline Overview
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Script as "run_RL_agent.py"
+    participant Env as "simglucose (UVA/Padova)"
+    participant Agent as "RL Controller"
+
+    User->>Script: Execute Training (Agent, Patient ID)
+    Script->>Env: Initialize Patient Scenario (Meals, HW)
+    Script->>Agent: Initialize Networks (Actor/Critic)
+    
+    loop Training Episode (e.g., 2000 steps)
+        Env->>Agent: State (CGM Reading)
+        Agent->>Agent: Process through Policy
+        Agent->>Env: Action (Insulin Dosage)
+        Env->>Env: Simulate Metabolism & Time Step
+        Env->>Agent: Next State, Reward, Done flag
+        Agent->>Agent: Store Transition in Buffer
+    end
+    
+    Script->>Agent: Update Networks (Compute Gradients)
+    Script->>User: Save Logs, Models to /results/
+```
 
 <h4>Project Folder Structure</h4>
 <pre>
@@ -196,5 +294,4 @@ Contact
 --
 Chirath Hettiarachchi - chirath.hettiarachchi@anu.edu.au\
 School of Computing, College of Engineering & Computer Science,\
-Australian National University. 
-
+Australian National University.
