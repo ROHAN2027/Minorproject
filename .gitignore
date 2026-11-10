@@ -1,0 +1,10 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+results/
+trained_weights/
+experiments/nci/
+.env
+.mobile_sync/
+experiments/nci/help.txt
